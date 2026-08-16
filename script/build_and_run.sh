@@ -25,10 +25,19 @@ APP_DISPLAY="OpenUsage"                 # user-facing app name
 BUNDLE_ID="${BUNDLE_ID:-com.robinebers.openusage.dev}"
 ICLOUD_CONTAINER_ID="iCloud.com.robinebers.openusage.dev"
 MIN_SYSTEM_VERSION="15.0"
-APP_VERSION="0.7.0"
-APP_BUILD="0.7.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Version: derived from the nearest reachable git tag, not a hardcoded literal. A hardcoded
+# "0.7.0" here made a build actually sitting on top of a much newer release (v0.7.10-beta.1)
+# claim to be OLDER than a release the user had already run separately (v0.7.9) — reading as
+# "this wasn't rebuilt from current code" even when it was current. "+3acct" marks this as the
+# Pantheon 3-accounts patch build (ticket c817f114) so it's never mistaken for an official
+# release. Both stay overridable (APP_VERSION/APP_BUILD) for anyone who wants the old fixed
+# literal back.
+GIT_BASE_VERSION="$(git -C "$ROOT_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+APP_VERSION="${APP_VERSION:-${GIT_BASE_VERSION:-0.0.0-unknown}+3acct}"
+APP_BUILD="${APP_BUILD:-$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || echo 0)}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_DISPLAY.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -133,7 +142,7 @@ cat >"$INFO_PLIST" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>$APP_VERSION-dev</string>
+  <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
   <string>$APP_BUILD</string>
   <key>LSMinimumSystemVersion</key>
