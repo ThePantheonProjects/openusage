@@ -26,7 +26,14 @@ enum ProviderCatalog {
             // Once extra Claude cards exist, an unpinned Desktop fallback could borrow a login that
             // belongs to one of them — fetching that account's usage onto the default card. Desktop
             // returns as its own properly-pinned source kind in Phase 3.
-            authStore: ClaudeAuthStore(allowsDesktopFallback: claudeCards.isEmpty),
+            authStore: ClaudeAuthStore(
+                allowsDesktopFallback: claudeCards.isEmpty,
+                // Also close the same leak for `CLAUDE_CONFIG_DIR` itself: without this, a value left
+                // in this process's own environment (inherited from whatever shell launched the app)
+                // that happens to name one of the extra cards' config dirs would silently repoint the
+                // default card's credentials AND identity onto that account instead of `~/.claude`.
+                reservedAccountConfigDirs: Set(claudeCards.map(\.configDirPath))
+            ),
             logUsageScanner: ClaudeLogUsageScanner(additionalRoots: defaultClaudeExtraLogRoots)
         ))
         for card in claudeCards {

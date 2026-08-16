@@ -186,6 +186,15 @@ struct ClaudeAuthStore: Sendable {
     /// because the Desktop login could belong to any of them — borrowing it unpinned could fetch one
     /// account's usage onto another account's card. Desktop-backed cards return properly in Phase 3.
     let allowsDesktopFallback: Bool
+    /// Config-dir paths (as `ClaudeConfigDirDiscovery` resolved them — absolute) that this launch's
+    /// account pass has already bound to a DIFFERENT, extra Claude account. `.standard`'s own
+    /// `CLAUDE_CONFIG_DIR` read must never land on one of these: `ProcessEnvironmentReader` reads the
+    /// raw process environment first, so a value merely left exported in whatever shell launched this
+    /// process (e.g. right after an inline `CLAUDE_CONFIG_DIR=~/.claude-b claude` login, in the same
+    /// terminal session) would otherwise silently redirect the DEFAULT card onto an extra account's
+    /// login — showing its numbers under the "claude" card while the true default account gets no
+    /// card at all. Empty for `.configDir` scope; irrelevant there since it never reads this env var.
+    let reservedAccountConfigDirs: Set<String>
 
     init(
         environment: EnvironmentReading = ProcessEnvironmentReader(),
@@ -194,6 +203,7 @@ struct ClaudeAuthStore: Sendable {
         desktop: ClaudeDesktopAuthStore? = nil,
         scope: ClaudeCredentialScope = .standard,
         allowsDesktopFallback: Bool = true,
+        reservedAccountConfigDirs: Set<String> = [],
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.environment = environment
@@ -202,6 +212,7 @@ struct ClaudeAuthStore: Sendable {
         self.desktop = desktop ?? ClaudeDesktopAuthStore(files: files, now: now)
         self.scope = scope
         self.allowsDesktopFallback = allowsDesktopFallback
+        self.reservedAccountConfigDirs = reservedAccountConfigDirs
         self.now = now
     }
 
@@ -363,7 +374,20 @@ struct ClaudeAuthStore: Sendable {
     }
 
     func claudeHomeOverride() -> String? {
-        envText("CLAUDE_CONFIG_DIR")
+        guard let override = envText("CLAUDE_CONFIG_DIR") else { return nil }
+        guard !reservedAccountConfigDirs.contains(Self.expandTilde(override)) else {
+            AppLog.warn(
+                LogTag.auth("claude"),
+                "CLAUDE_CONFIG_DIR in this process's environment names an extra account's config dir; ignoring it for the default card"
+            )
+            return nil
+        }
+        return override
+    }
+
+    private static func expandTilde(_ path: String) -> String {
+        guard path == "~" || path.hasPrefix("~/") else { return path }
+        return NSHomeDirectory() + String(path.dropFirst(1))
     }
 
     // Resolved OAuth endpoint strings before URL validation. The suffix is derived from the same
@@ -544,7 +568,11 @@ struct ClaudeAuthStore: Sendable {
         if case .configDir(let path, _) = scope {
             return "\(path)/\(Self.credentialFileName)"
         }
-        return "\(envText("CLAUDE_CONFIG_DIR") ?? Self.defaultClaudeHome)/\(Self.credentialFileName)"
+        // Routes through `claudeHomeOverride()` (not a second, independent `envText` read) so this
+        // path and the keychain-service candidates always agree on whether an override is in play —
+        // including the `reservedAccountConfigDirs` guard that keeps a leaked `CLAUDE_CONFIG_DIR`
+        // from redirecting the default card onto an extra account's home.
+        return "\(claudeHomeOverride() ?? Self.defaultClaudeHome)/\(Self.credentialFileName)"
     }
 
     private func envText(_ name: String) -> String? {
