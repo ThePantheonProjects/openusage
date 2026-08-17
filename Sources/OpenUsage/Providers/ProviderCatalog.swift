@@ -12,7 +12,8 @@ enum ProviderCatalog {
     static func make(
         defaults: UserDefaults = .standard,
         claudeCards: [ClaudeAccountCard] = [],
-        defaultClaudeExtraLogRoots: [URL] = []
+        defaultClaudeExtraLogRoots: [URL] = [],
+        defaultClaudeExtraKeychainLiterals: [String] = []
     ) -> [ProviderRuntime] {
         // Default provider order (see AGENTS.md "## Providers"): the three established providers first,
         // then every other provider alphabetically by display name. Account cards slot in right after
@@ -32,7 +33,11 @@ enum ProviderCatalog {
                 // in this process's own environment (inherited from whatever shell launched the app)
                 // that happens to name one of the extra cards' config dirs would silently repoint the
                 // default card's credentials AND identity onto that account instead of `~/.claude`.
-                reservedAccountConfigDirs: Set(claudeCards.map(\.configDirPath))
+                reservedAccountConfigDirs: Set(claudeCards.map(\.configDirPath)),
+                // Same-account extra config-dir logins (e.g. a fresh CLI login created to dodge a
+                // per-login rate limit on the default) — extra credential sources the default card's
+                // refresh loop falls back to when its own login can't read usage.
+                sameAccountKeychainLiterals: defaultClaudeExtraKeychainLiterals
             ),
             logUsageScanner: ClaudeLogUsageScanner(additionalRoots: defaultClaudeExtraLogRoots)
         ))

@@ -141,6 +141,11 @@ final class ProviderAccountAssemblyTests: XCTestCase {
 
         XCTAssertTrue(assembly.claudeCards.isEmpty, "one account never renders as two cards")
         XCTAssertEqual(assembly.defaultClaudeExtraLogRoots.map(\.path), ["/Users/dev/.claude-side"])
+        // The fold must also carry the dir's keychain literal forward — otherwise the extra login only
+        // ever benefits the default card's local spend-log scan and never its actual usage reads (the
+        // bug this fixes: a same-account config-dir login created to dodge a per-login rate limit on
+        // the default silently did nothing for the card that needed it).
+        XCTAssertEqual(assembly.defaultClaudeExtraKeychainLiterals, ["/Users/dev/.claude-side"])
         let record = try XCTUnwrap(store.defaultBadgeHolder(family: "claude"))
         XCTAssertEqual(record.id, "claude")
         XCTAssertEqual(Set(record.sources.map(\.kind)), [.defaultHome, .configDir])

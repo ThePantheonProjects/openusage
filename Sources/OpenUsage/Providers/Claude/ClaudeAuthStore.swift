@@ -195,6 +195,14 @@ struct ClaudeAuthStore: Sendable {
     /// login — showing its numbers under the "claude" card while the true default account gets no
     /// card at all. Empty for `.configDir` scope; irrelevant there since it never reads this env var.
     let reservedAccountConfigDirs: Set<String>
+    /// Same-account custom config dirs' keychain literals (`ProviderAccountAssembly`'s
+    /// `defaultClaudeExtraKeychainLiterals`), in discovery order — extra credential sources this
+    /// `.standard` store falls back to when the default login can't read usage. Tried strictly AFTER
+    /// the default keychain/file candidates (`orderedStoredCandidates`), so the default login is
+    /// always preferred first; empty by default, which keeps every existing `.standard`/`.configDir`
+    /// caller byte-identical to the historical behavior. Never consulted for `.configDir` scope
+    /// (that scope pins to exactly one login).
+    let sameAccountKeychainLiterals: [String]
 
     init(
         environment: EnvironmentReading = ProcessEnvironmentReader(),
@@ -204,6 +212,7 @@ struct ClaudeAuthStore: Sendable {
         scope: ClaudeCredentialScope = .standard,
         allowsDesktopFallback: Bool = true,
         reservedAccountConfigDirs: Set<String> = [],
+        sameAccountKeychainLiterals: [String] = [],
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.environment = environment
@@ -213,6 +222,7 @@ struct ClaudeAuthStore: Sendable {
         self.scope = scope
         self.allowsDesktopFallback = allowsDesktopFallback
         self.reservedAccountConfigDirs = reservedAccountConfigDirs
+        self.sameAccountKeychainLiterals = sameAccountKeychainLiterals
         self.now = now
     }
 
@@ -502,6 +512,7 @@ struct ClaudeAuthStore: Sendable {
         var candidates: [ClaudeCredentialState] = []
         if let keychain = loadKeychainCredentials() { candidates.append(keychain) }
         if let file = loadFileCredentials() { candidates.append(file) }
+        candidates += extraSameAccountKeychainCandidates(excluding: candidates)
 
         if candidates.count > 1 {
             let labels = candidates.map(\.source.label).joined(separator: ", ")
@@ -510,6 +521,42 @@ struct ClaudeAuthStore: Sendable {
             AppLog.debug(LogTag.auth("claude"), "credential source: \(only.source.label)")
         }
         return candidates
+    }
+
+    /// Same-account config-dir keychain credentials, appended AFTER the primary keychain/file
+    /// candidates above — the default login is always tried first; these only get used when it
+    /// fails (auth-shaped error) or is rate-limited and a later source remains untried
+    /// (`ClaudeProvider`'s per-candidate refresh loop). Keychain-only by design: a config dir's
+    /// `.credentials.json` file can't be added here without also teaching `save()` to write a
+    /// rotated token back to THAT dir's file (not the default's) — the keychain item's `service`
+    /// name already carries its own identity, so `save()` handles it correctly with no changes.
+    private func extraSameAccountKeychainCandidates(excluding existing: [ClaudeCredentialState]) -> [ClaudeCredentialState] {
+        guard scope == .standard, !sameAccountKeychainLiterals.isEmpty else { return [] }
+        var seenServices = Set(existing.compactMap { state -> String? in
+            switch state.source {
+            case .keychainCurrentUser(let service), .keychainLegacy(let service): service
+            default: nil
+            }
+        })
+        var extras: [ClaudeCredentialState] = []
+        for literal in sameAccountKeychainLiterals {
+            let service = Self.scopedKeychainServiceName(forConfigDirLiteral: literal, environment: environment)
+            guard seenServices.insert(service).inserted else { continue }
+            if let state = credentialState(
+                from: try? keychain.readGenericPasswordForCurrentUser(service: service),
+                service: service, source: .keychainCurrentUser(service: service)
+            ) {
+                extras.append(state)
+                continue
+            }
+            if let state = credentialState(
+                from: try? keychain.readGenericPassword(service: service),
+                service: service, source: .keychainLegacy(service: service)
+            ) {
+                extras.append(state)
+            }
+        }
+        return extras
     }
 
     private func loadFileCredentials() -> ClaudeCredentialState? {

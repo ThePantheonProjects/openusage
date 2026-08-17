@@ -79,7 +79,8 @@ final class AppContainer {
 
         let providers = ProviderCatalog.make(
             claudeCards: accountAssembly.claudeCards,
-            defaultClaudeExtraLogRoots: accountAssembly.defaultClaudeExtraLogRoots
+            defaultClaudeExtraLogRoots: accountAssembly.defaultClaudeExtraLogRoots,
+            defaultClaudeExtraKeychainLiterals: accountAssembly.defaultClaudeExtraKeychainLiterals
         )
         let registry = WidgetRegistry.from(providers)
         let apiKeyProviders = providers.compactMap { $0 as? any APIKeyManaging }

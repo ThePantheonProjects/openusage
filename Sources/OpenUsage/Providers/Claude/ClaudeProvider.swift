@@ -31,10 +31,27 @@ final class ClaudeProvider: ProviderRuntime {
     /// last-good bars with a staleness note instead of blanking the dashboard, and skip the live call
     /// entirely until the cooldown expires so we don't keep hammering an endpoint that's already limiting
     /// us. Mirrors the legacy plugin's `cachedUsageData` + `rateLimitedUntilMs`.
-    private var cachedCredentialFingerprint: Data?
+    ///
+    /// The cooldown and its credential fingerprint are keyed PER SOURCE (`ClaudeCredentialState.Source`),
+    /// not globally: a card can now hold multiple same-account credential sources (default keychain, a
+    /// same-account config-dir login), and each is rate-limited independently by Anthropic. A shared,
+    /// unkeyed cooldown would either block a fallback source that was never actually rate-limited, or —
+    /// since the two sources' fingerprints keep alternating within one multi-candidate refresh — get
+    /// reset every time the loop switches sources and end up hammering a source that's still cooling
+    /// down. `lastGoodUsage` alone stays shared: whichever source most recently produced live numbers is
+    /// what the graceful degrade should keep showing, regardless of which source that was.
+    private var cachedCredentialFingerprints: [ClaudeCredentialState.Source: Data] = [:]
     private var lastGoodUsage: ClaudeMappedUsage?
-    private var rateLimitedUntil: Date?
+    private var rateLimitedUntilBySource: [ClaudeCredentialState.Source: Date] = [:]
     private static let rateLimitCooldown: TimeInterval = 5 * 60
+
+    /// Internal signal thrown by `fetchLiveUsage` when a source is rate-limited (429, or still inside a
+    /// prior 429's cooldown) AND another credential source remains untried this refresh. Caught only
+    /// inside `refresh()`'s candidate loop — mirrors `ClaudeAuthError.allowsAuthFallback`'s "try the next
+    /// source" flow, but for rate limits rather than auth failures. Never thrown when this is the LAST
+    /// candidate — that path is unchanged: serve the graceful rate-limited/last-good snapshot exactly as
+    /// before, so a card with no extra same-account login behaves byte-identically to today.
+    private struct RateLimitedFallback: Error {}
 
     init(
         provider: Provider = ClaudeProvider.makeProvider(),
@@ -169,7 +186,7 @@ final class ClaudeProvider: ProviderRuntime {
         // request/transport failure) surfaces immediately so a real outage is never masked as a retry.
         var lastFallbackError: ClaudeAuthError?
         var credentialGeneration = ClaudeCredentialGeneration(storedCandidates)
-        for state in candidates {
+        for (index, state) in candidates.enumerated() {
             // The environment token cannot read subscription usage. If a CLI login was rejected, try
             // Desktop before this spend-only fallback can turn the refresh into a false success.
             if !forceDesktopFallback,
@@ -187,7 +204,8 @@ final class ClaudeProvider: ProviderRuntime {
                 let snapshot = try await probe(
                     state: state,
                     credentialGeneration: &credentialGeneration,
-                    fallbackWarning: desktopFallbackWarning
+                    fallbackWarning: desktopFallbackWarning,
+                    hasFallbackCandidate: index < candidates.count - 1
                 )
                 AppLog.info(LogTag.plugin("claude"), "refresh end (\(Int(Date().timeIntervalSince(start) * 1000))ms)")
                 return snapshot
@@ -201,6 +219,12 @@ final class ClaudeProvider: ProviderRuntime {
             } catch let error as ClaudeAuthError where error.allowsAuthFallback {
                 AppLog.warn(LogTag.auth("claude"), "\(state.source.label) failed (\(error)); falling back to next source if any")
                 lastFallbackError = error
+                continue
+            } catch is RateLimitedFallback {
+                // Never thrown on the last candidate (see `RateLimitedFallback`'s doc), so the loop
+                // always terminates via a `return` above or below — this `continue` always has a next
+                // source to try.
+                AppLog.info(LogTag.plugin("claude"), "\(state.source.label) rate-limited; falling back to next source")
                 continue
             } catch {
                 return ProviderSnapshot.error(provider: provider, error: error)
@@ -226,7 +250,8 @@ final class ClaudeProvider: ProviderRuntime {
     private func probe(
         state initialState: ClaudeCredentialState,
         credentialGeneration: inout ClaudeCredentialGeneration,
-        fallbackWarning: String?
+        fallbackWarning: String?,
+        hasFallbackCandidate: Bool
     ) async throws -> ProviderSnapshot {
         var state = initialState
         var mapped = ClaudeMappedUsage(
@@ -242,7 +267,8 @@ final class ClaudeProvider: ProviderRuntime {
         case .available:
             mapped = try await fetchLiveUsage(
                 state: &state,
-                credentialGeneration: &credentialGeneration
+                credentialGeneration: &credentialGeneration,
+                hasFallbackCandidate: hasFallbackCandidate
             )
             // A rate-limited fetch rides its "Updates blocked by Anthropic" notice on the mapped usage so
             // it reaches the header triangle even when the badge/note lines aren't in the user's layout.
@@ -304,15 +330,22 @@ final class ClaudeProvider: ProviderRuntime {
 
     private func fetchLiveUsage(
         state: inout ClaudeCredentialState,
-        credentialGeneration: inout ClaudeCredentialGeneration
+        credentialGeneration: inout ClaudeCredentialGeneration,
+        hasFallbackCandidate: Bool
     ) async throws -> ClaudeMappedUsage {
         var expectedGeneration = credentialGeneration
         defer { credentialGeneration = expectedGeneration }
-        activateLiveUsageCache(for: state.oauth)
+        activateLiveUsageCache(for: state)
 
-        // Inside an active rate-limit cooldown, skip the live call and serve the last-good usage so a
-        // constantly-limited endpoint doesn't blank the dashboard (and we don't pile on more 429s).
-        if let until = rateLimitedUntil, now() < until {
+        // Inside an active rate-limit cooldown FOR THIS SOURCE, skip the live call. With a fallback
+        // source available, move straight to it instead of serving (and re-arming) the graceful
+        // badge on a source we already know is still limited; with none, serve last-good usage exactly
+        // as before so a constantly-limited endpoint doesn't blank the dashboard.
+        if let until = rateLimitedUntilBySource[state.source], now() < until {
+            if hasFallbackCandidate {
+                AppLog.info(LogTag.plugin("claude"), "\(state.source.label) still cooling down from a rate limit; trying next credential source")
+                throw RateLimitedFallback()
+            }
             AppLog.info(LogTag.plugin("claude"), "rate-limited (cooldown active, serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
             return rateLimitedSnapshot(credentials: state.oauth, retryAfterSeconds: Int(until.timeIntervalSince(now()).rounded(.up)))
         }
@@ -362,17 +395,23 @@ final class ClaudeProvider: ProviderRuntime {
         guard currentGeneration == expectedGeneration else { throw ClaudeAuthError.credentialsChanged }
 
         // 429 can come back from either attempt; the helper hands both through unchanged. Start a cooldown
-        // (respecting Retry-After) and serve the last-good usage rather than a bare badge.
+        // (respecting Retry-After) for THIS source. With a fallback source available, try it this same
+        // refresh instead of settling for the graceful badge; with none, serve the last-good usage rather
+        // than a bare badge — unchanged from before.
         if response.statusCode == 429 {
             let retryAfterSeconds = ClaudeUsageMapper.parseRetryAfterSeconds(response, now: now())
-            rateLimitedUntil = now().addingTimeInterval(TimeInterval(retryAfterSeconds ?? Int(Self.rateLimitCooldown)))
+            rateLimitedUntilBySource[working.source] = now().addingTimeInterval(TimeInterval(retryAfterSeconds ?? Int(Self.rateLimitCooldown)))
+            if hasFallbackCandidate {
+                AppLog.info(LogTag.plugin("claude"), "rate-limited (\(working.source.label)); trying next credential source")
+                throw RateLimitedFallback()
+            }
             AppLog.info(LogTag.plugin("claude"), "rate-limited (serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
             return rateLimitedSnapshot(credentials: working.oauth, retryAfterSeconds: retryAfterSeconds)
         }
 
         let mapped = try ClaudeUsageMapper.mapUsageResponse(response, credentials: working.oauth, now: now())
         lastGoodUsage = mapped
-        rateLimitedUntil = nil
+        rateLimitedUntilBySource[working.source] = nil
         return mapped
     }
 
@@ -389,14 +428,18 @@ final class ClaudeProvider: ProviderRuntime {
         return mapped
     }
 
-    /// Cache state belongs to the complete access + refresh credential pair. A login change therefore
-    /// clears both last-good usage and cooldown, even when the two accounts share an access token.
-    private func activateLiveUsageCache(for credentials: ClaudeOAuth) {
-        let fingerprint = Self.credentialFingerprint(credentials)
-        guard cachedCredentialFingerprint != fingerprint else { return }
-        cachedCredentialFingerprint = fingerprint
+    /// Cache state belongs to the complete access + refresh credential pair, tracked per source. A
+    /// login change on a given source (e.g. an external `claude` re-login rotating the default's
+    /// token) clears that source's own cooldown so it gets an immediate fresh attempt rather than
+    /// waiting out a cooldown recorded against the token it just replaced. `lastGoodUsage` stays
+    /// shared across sources: whichever source most recently produced live numbers is what a graceful
+    /// degrade should keep showing.
+    private func activateLiveUsageCache(for state: ClaudeCredentialState) {
+        let fingerprint = Self.credentialFingerprint(state.oauth)
+        guard cachedCredentialFingerprints[state.source] != fingerprint else { return }
+        cachedCredentialFingerprints[state.source] = fingerprint
         lastGoodUsage = nil
-        rateLimitedUntil = nil
+        rateLimitedUntilBySource[state.source] = nil
     }
 
     private static func credentialFingerprint(_ credentials: ClaudeOAuth) -> Data {
@@ -419,11 +462,22 @@ final class ClaudeProvider: ProviderRuntime {
     ) async throws -> RefreshedAccess {
         AppLog.info(LogTag.auth("claude"), "token refresh attempt")
         let response = try await usageClient.refreshToken(refreshToken, config: authStore.oauthConfig())
-        if response.statusCode == 400 || response.statusCode == 401 {
+        if response.statusCode == 400 || response.statusCode == 401 || response.statusCode == 403 {
             let body = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
             let errorCode = body?["error"] as? String ?? body?["error_description"] as? String
             if errorCode == "invalid_grant" {
                 AppLog.warn(LogTag.auth("claude"), "session expired (invalid_grant)")
+                throw ClaudeAuthError.sessionExpired
+            }
+            if response.statusCode == 403 {
+                // 403 means this credential is forbidden from refreshing at all (revoked client, locked
+                // account, …) — auth-shaped like invalid_grant, not a transport/proxy failure, so route
+                // it through the same re-read path: `ClaudeAuthError.sessionExpired.allowsAuthFallback`
+                // lets the refresh loop fall through to the next credential source instead of failing
+                // the whole refresh outright (b3e17301 — the previous generic `requestFailed` here
+                // wasn't fallback-eligible, so a 403 killed the refresh even when another source, e.g. a
+                // same-account config-dir login, could have served it).
+                AppLog.warn(LogTag.auth("claude"), "session expired (403 on refresh)")
                 throw ClaudeAuthError.sessionExpired
             }
             // A 400/401 without a recognized OAuth error code isn't necessarily an expired token — it
@@ -462,8 +516,8 @@ final class ClaudeProvider: ProviderRuntime {
             AppLog.error(LogTag.auth("claude"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
             persisted = false
         }
-        if cachedCredentialFingerprint == Self.credentialFingerprint(previousOAuth) {
-            cachedCredentialFingerprint = Self.credentialFingerprint(state.oauth)
+        if cachedCredentialFingerprints[state.source] == Self.credentialFingerprint(previousOAuth) {
+            cachedCredentialFingerprints[state.source] = Self.credentialFingerprint(state.oauth)
         }
         AppLog.info(LogTag.auth("claude"), "token refresh ok (rotated)")
         return RefreshedAccess(accessToken: decoded.accessToken, persisted: persisted)

@@ -34,6 +34,12 @@ struct ProviderAccountAssembly {
     /// Same-account custom config dirs discovered for the DEFAULT card's login: extra spend-log
     /// roots for the default scanner, never extra credentials.
     var defaultClaudeExtraLogRoots: [URL] = []
+    /// Same-account custom config dirs' keychain literals, in discovery order: extra credential
+    /// sources the default card's `ClaudeAuthStore` may fall back to when its own login can't read
+    /// usage (session lockout, 403, 429) — so a same-account extra login (e.g. a fresh CLI login
+    /// created to dodge a per-login rate limit on the default) actually benefits the card's usage
+    /// reads instead of only feeding its local spend-log scan.
+    var defaultClaudeExtraKeychainLiterals: [String] = []
 
     /// `waitsForLoginShell`: true for the menu-bar app (a Finder/Dock launch inherits no shell
     /// exports, so the pass leans on the login-shell layers), false for the one-shot CLI (a terminal
@@ -132,6 +138,7 @@ struct ProviderAccountAssembly {
         // and a custom-dir-only login should still get its card.
         var foundClaudeAccounts: [(identityKey: String, label: String?, dirs: [ClaudeConfigDirDiscovery.Finding])] = []
         var defaultClaudeExtraLogRoots: [URL] = []
+        var defaultClaudeExtraKeychainLiterals: [String] = []
         let claudeOutcome = outcomes.first { $0.family == "claude" }?.outcome
         if let claudeDiscovery, let claudeOutcome {
             if case .unresolved = claudeOutcome {
@@ -163,6 +170,7 @@ struct ProviderAccountAssembly {
                         // that card, never a second card — duplicate cards are structurally
                         // impossible because identity routes the source to the existing record.
                         defaultClaudeExtraLogRoots += findings.map { URL(fileURLWithPath: $0.anchorPath) }
+                        defaultClaudeExtraKeychainLiterals += findings.map(\.keychainLiteral)
                         if let index = observations.firstIndex(where: { $0.family == "claude" && $0.identityKey == identityKey }) {
                             observations[index].sources += sources
                         }
@@ -213,7 +221,8 @@ struct ProviderAccountAssembly {
         return ProviderAccountAssembly(
             identityKeysByCard: identityKeys,
             claudeCards: claudeCards,
-            defaultClaudeExtraLogRoots: defaultClaudeExtraLogRoots
+            defaultClaudeExtraLogRoots: defaultClaudeExtraLogRoots,
+            defaultClaudeExtraKeychainLiterals: defaultClaudeExtraKeychainLiterals
         )
     }
 }

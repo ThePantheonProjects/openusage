@@ -189,6 +189,65 @@ final class ClaudeAuthStoreTests: XCTestCase {
         XCTAssertEqual(store.liveUsageAvailability(state(["user:inference"], inferenceOnly: true)), .inferenceOnlyToken)
     }
 
+    func testStandardStoreAppendsSameAccountConfigDirKeychainCandidatesAfterTheDefault() {
+        // A same-account extra config-dir login (e.g. a fresh CLI login created to dodge a per-login
+        // rate limit on the default) must land as an ADDITIONAL fallback candidate, tried only after
+        // the default — never ahead of it, and never merged away into nothing (the bug this fixes).
+        let keychain = ServiceKeychain()
+        let environment = FakeEnvironment([:])
+        keychain.currentUserValues["Claude Code-credentials"] =
+            #"{"claudeAiOauth":{"accessToken":"default-token","subscriptionType":"pro"}}"#
+        let extraService = ClaudeAuthStore.scopedKeychainServiceName(
+            forConfigDirLiteral: "~/.claude-reader-a", environment: environment
+        )
+        keychain.currentUserValues[extraService] =
+            #"{"claudeAiOauth":{"accessToken":"reader-a-token","subscriptionType":"max"}}"#
+        let store = ClaudeAuthStore(
+            environment: environment,
+            files: FakeFiles(),
+            keychain: keychain,
+            sameAccountKeychainLiterals: ["~/.claude-reader-a"]
+        )
+
+        let candidates = store.loadCredentialCandidates()
+
+        XCTAssertEqual(candidates.map(\.oauth.accessToken), ["default-token", "reader-a-token"])
+    }
+
+    func testSameAccountKeychainCandidatesAreDedupedAndNeverReadForConfigDirScope() {
+        // A literal that happens to hash to the same service the primary probe already found (e.g. the
+        // default's own CLAUDE_CONFIG_DIR override) must not be read twice; and an extra card's own
+        // `.configDir` scope must never consult another account's `sameAccountKeychainLiterals` even if
+        // one were mistakenly passed to it — that scope pins to exactly one login.
+        let keychain = ServiceKeychain()
+        let environment = FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"])
+        let store = ClaudeAuthStore(
+            environment: environment,
+            files: FakeFiles(),
+            keychain: keychain
+        )
+        let overrideService = store.keychainServiceCandidates().first!
+        keychain.currentUserValues[overrideService] =
+            #"{"claudeAiOauth":{"accessToken":"only-token","subscriptionType":"pro"}}"#
+
+        let dedupedStore = ClaudeAuthStore(
+            environment: environment,
+            files: FakeFiles(),
+            keychain: keychain,
+            sameAccountKeychainLiterals: ["/tmp/claude"]
+        )
+        XCTAssertEqual(dedupedStore.loadCredentialCandidates().map(\.oauth.accessToken), ["only-token"])
+
+        let scopedStore = ClaudeAuthStore(
+            environment: environment,
+            files: FakeFiles(),
+            keychain: keychain,
+            scope: .configDir(path: "/Users/dev/.claude-work", keychainLiteral: "~/.claude-work"),
+            sameAccountKeychainLiterals: ["/tmp/claude"]
+        )
+        XCTAssertTrue(scopedStore.loadCredentialCandidates().isEmpty, "a .configDir card never borrows another source")
+    }
+
     func testMalformedCustomOAuthURLThrowsInsteadOfCrashing() {
         // A malformed custom OAuth URL is system-boundary input: oauthConfig() must fail loudly
         // rather than force-unwrap a nil URL (which crashes) or silently fall back to prod.
@@ -731,6 +790,139 @@ final class ClaudeProviderTests: XCTestCase {
         XCTAssertEqual(Self.progress(third.lines, "Session")?.used, 25)
         XCTAssertEqual(third.warning?.hasPrefix("Updates blocked by Anthropic"), true)
         XCTAssertEqual(httpClient.requests.filter { $0.url.absoluteString.hasSuffix("/api/oauth/usage") }.count, 2)
+    }
+
+    func testFallsBackToSameAccountConfigDirLoginWhenTheDefaultIsRateLimited() async {
+        // The actual bug this fixes: Anthropic 429s the default login for days ("Updates blocked by
+        // Anthropic… retry ~20m"). A fresh same-account login in a config dir (created specifically to
+        // dodge that per-login limit) must actually get used for the card's usage read instead of only
+        // feeding its local spend-log scan.
+        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let environment = FakeEnvironment([:])
+        let keychain = ServiceKeychain()
+        keychain.currentUserValues["Claude Code-credentials"] =
+            #"{"claudeAiOauth":{"accessToken":"default-token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+        let readerAService = ClaudeAuthStore.scopedKeychainServiceName(
+            forConfigDirLiteral: "~/.claude-reader-a", environment: environment
+        )
+        keychain.currentUserValues[readerAService] =
+            #"{"claudeAiOauth":{"accessToken":"reader-a-token","subscriptionType":"max","scopes":["user:profile"]}}"#
+
+        let httpClient = RoutingHTTPClient { request in
+            guard request.url.absoluteString.hasSuffix("/api/oauth/usage") else {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data())
+            }
+            let authorization = request.headers["Authorization"] ?? ""
+            if authorization.contains("reader-a-token") {
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"five_hour":{"utilization":42,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
+                )
+            }
+            // The default login: still rate-limited.
+            return HTTPResponse(statusCode: 429, headers: ["retry-after": "1200"], body: Data())
+        }
+        let provider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: environment,
+                files: FakeFiles(),
+                keychain: keychain,
+                sameAccountKeychainLiterals: ["~/.claude-reader-a"],
+                now: { now }
+            ),
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        // Recovered via the fallback source: live numbers, the fallback's plan, no rate-limited badge.
+        XCTAssertEqual(snapshot.plan, "Max")
+        XCTAssertEqual(Self.progress(snapshot.lines, "Session")?.used, 42)
+        XCTAssertNil(badge(snapshot.lines, "Status"))
+        XCTAssertNil(snapshot.warning)
+        let usageCalls = httpClient.requests.filter { $0.url.absoluteString.hasSuffix("/api/oauth/usage") }
+        XCTAssertEqual(usageCalls.count, 2, "both the rate-limited default and the working fallback were tried this refresh")
+    }
+
+    func testSingleCandidateRateLimitStillServesTheGracefulBadgeWithNoFallback() async {
+        // With no extra same-account login (today's common case, `sameAccountKeychainLiterals` empty),
+        // a 429 on the only candidate must behave exactly as before: a graceful badge, not a hard error
+        // — the new fallback path must never fire when there's nothing to fall back to.
+        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 429, headers: ["retry-after": "600"], body: Data()))
+        let provider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
+                files: FakeFiles([
+                    "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+                ]),
+                keychain: FakeKeychain(),
+                now: { now }
+            ),
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(badge(snapshot.lines, "Status")?.hasPrefix("Rate limited"), true)
+        XCTAssertEqual(httpClient.requests.count, 1)
+    }
+
+    func testRefreshTreats403OnRefreshEndpointAsAuthShapedAndFallsBackToNextSource() async {
+        // b3e17301: a 403 on the token-refresh endpoint (a revoked client / locked account, distinct
+        // from the 400/401 + invalid_grant shape) must be treated as auth-shaped, not a generic
+        // transport `requestFailed` — so the refresh loop falls through to the next credential source
+        // instead of killing the whole refresh, mirroring #687's keychain → file fallback.
+        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"fresh-access","refreshToken":"fresh-refresh","expiresAt":4070908800000,"subscriptionType":"pro","scopes":["user:profile"]}}"#
+        ])
+        let keychain = ServiceKeychain()
+        let authStore = ClaudeAuthStore(
+            environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
+            files: files,
+            keychain: keychain,
+            now: { now }
+        )
+        let hashedService = authStore.keychainServiceCandidates().first!
+        keychain.currentUserValues[hashedService] = #"{"claudeAiOauth":{"accessToken":"stale-access","refreshToken":"stale-refresh","expiresAt":4102444800000,"subscriptionType":"max","scopes":["user:profile"]}}"#
+
+        let httpClient = RoutingHTTPClient { request in
+            if request.url.absoluteString.hasSuffix("/api/oauth/usage") {
+                let authorization = request.headers["Authorization"] ?? ""
+                guard authorization.contains("fresh-access") else {
+                    return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+                }
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"five_hour":{"utilization":42,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
+                )
+            }
+            // Refresh endpoint: only the stale keychain candidate reaches here, and it's forbidden (403)
+            // rather than a recognized invalid_grant body.
+            return HTTPResponse(statusCode: 403, headers: [:], body: Data())
+        }
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.plan, "Pro")
+        XCTAssertEqual(Self.progress(snapshot.lines, "Session")?.used, 42)
+        XCTAssertNil(badge(snapshot.lines, "Error"))
     }
 
     func testRefreshSurfacesRequestFailureForNonOAuthRefreshErrorBody() async {
