@@ -396,6 +396,25 @@ final class ClaudeUsageMapperTests: XCTestCase {
         XCTAssertEqual(text(mapped.lines, "Note"), "Live usage rate limited - retry in ~10m")
     }
 
+    func testRateLimitedWarningEscalatesAtThePersistentStreakThreshold() {
+        // Below threshold: the ordinary transient-429 "be patient" notice, unchanged.
+        let threshold = ClaudeUsageMapper.persistentRateLimitStreakThreshold
+        XCTAssertEqual(
+            ClaudeUsageMapper.rateLimitedWarning(retryAfterSeconds: 600, consecutivePolls: threshold - 1),
+            "Updates blocked by Anthropic. Be patient — manual refreshes will make it worse. Retrying in ~10m."
+        )
+        // At threshold: the actionable, login-specific hint replaces it entirely.
+        XCTAssertEqual(
+            ClaudeUsageMapper.rateLimitedWarning(retryAfterSeconds: 600, consecutivePolls: threshold),
+            "This login is rate-limit-penalized by Anthropic — other logins on this account read fine. Add a dedicated reader login for this card."
+        )
+        // The default parameter (no caller-supplied streak) must not accidentally escalate.
+        XCTAssertEqual(
+            ClaudeUsageMapper.rateLimitedWarning(retryAfterSeconds: 600),
+            "Updates blocked by Anthropic. Be patient — manual refreshes will make it worse. Retrying in ~10m."
+        )
+    }
+
     private func progress(_ lines: [MetricLine], _ label: String) -> (used: Double, limit: Double, resetsAt: Date?, periodDurationMs: Int?)? {
         guard case .progress(_, let used, let limit, _, let resetsAt, let periodDurationMs, _) = lines.first(where: { $0.label == label }) else {
             return nil
@@ -956,6 +975,144 @@ final class ClaudeProviderTests: XCTestCase {
 
         XCTAssertEqual(badge(snapshot.lines, "Error"), ProviderUsageErrorText.requestFailed(statusCode: 400))
         XCTAssertNotEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.tokenExpired.localizedDescription)
+    }
+
+    func testDirect403OnUsageEndpointRoutesToAuthNeededState() async {
+        // TASK-4277: a 403 on the usage READ itself (as opposed to the refresh-token endpoint, covered by
+        // `testRefreshTreats403OnRefreshEndpointAsAuthShapedAndFallsBackToNextSource`) must reach the same
+        // auth-needed, re-login state as a 401 rather than a generic, unactionable "request failed" —
+        // `ProviderAuthRetry.isAuthFailure` treats 401 and 403 identically, so a still-forbidden retry
+        // (after a successful token refresh) surfaces `ClaudeAuthError.tokenExpired`.
+        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"stale-token","refreshToken":"refresh-1","expiresAt":4102444800000,"subscriptionType":"pro","scopes":["user:profile"]}}"#
+        ])
+        let httpClient = RoutingHTTPClient { request in
+            if request.url.absoluteString.hasSuffix("/api/oauth/usage") {
+                // Forbidden both before and after the refresh — the account lost usage access outright.
+                return HTTPResponse(statusCode: 403, headers: [:], body: Data())
+            }
+            // The refresh call itself succeeds; it's the usage read that stays forbidden.
+            return HTTPResponse(
+                statusCode: 200,
+                headers: [:],
+                body: Data(#"{"access_token":"fresh-token","refresh_token":"refresh-2","expires_in":3600}"#.utf8)
+            )
+        }
+        let provider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
+                files: files,
+                keychain: FakeKeychain(),
+                now: { now }
+            ),
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.tokenExpired.localizedDescription)
+        XCTAssertEqual(badge(snapshot.lines, "Error"), "Token expired. Run `claude` to log in again.")
+        let usageCalls = httpClient.requests.filter { $0.url.absoluteString.hasSuffix("/api/oauth/usage") }
+        XCTAssertEqual(usageCalls.count, 2, "the usage endpoint is retried once after a refresh before the auth-needed state is surfaced")
+    }
+
+    func testPersistentRetryAfter429StreakEscalatesWarningToActionableHint() async {
+        // TASK-4277: the live incident this fixes — Anthropic 429s one specific login every poll for
+        // days ("retry-after ~20m each poll") while a second login on the same account reads clean. A
+        // single 429, or even a few, must stay the ordinary "be patient" notice; only once the same
+        // retry-after-bearing 429 has repeated for `persistentRateLimitStreakThreshold` consecutive polls
+        // does the warning name the actual, actionable fix.
+        let t0 = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let clock = TestClock(t0)
+        let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 429, headers: ["retry-after": "60"], body: Data()))
+        let provider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
+                files: FakeFiles([
+                    "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+                ]),
+                keychain: FakeKeychain(),
+                now: { clock.now }
+            ),
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            now: { clock.now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let threshold = ClaudeUsageMapper.persistentRateLimitStreakThreshold
+        for poll in 1...threshold {
+            let snapshot = await provider.refresh()
+            if poll < threshold {
+                XCTAssertEqual(
+                    snapshot.warning?.hasPrefix("Updates blocked by Anthropic"), true,
+                    "poll \(poll) of \(threshold) should still read as an ordinary transient rate limit"
+                )
+            } else {
+                XCTAssertEqual(
+                    snapshot.warning,
+                    "This login is rate-limit-penalized by Anthropic — other logins on this account read fine. Add a dedicated reader login for this card."
+                )
+            }
+            // Past the 60s cooldown, so the next refresh makes a fresh network call rather than skipping.
+            clock.set(clock.now.addingTimeInterval(61))
+        }
+    }
+
+    func testLiveSuccessResetsThePersistentRateLimitStreak() async {
+        // An intervening success (the login recovers, however briefly) must break the streak — the next
+        // rate limit is a fresh transient one, not a continuation of the old penalty.
+        let t0 = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let clock = TestClock(t0)
+        let usageCalls = CallCounter()
+        let threshold = ClaudeUsageMapper.persistentRateLimitStreakThreshold
+        let httpClient = RoutingHTTPClient { request in
+            guard request.url.absoluteString.hasSuffix("/api/oauth/usage") else {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data())
+            }
+            if usageCalls.next() == threshold + 1 {
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"five_hour":{"utilization":10,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
+                )
+            }
+            return HTTPResponse(statusCode: 429, headers: ["retry-after": "60"], body: Data())
+        }
+        let provider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
+                files: FakeFiles([
+                    "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+                ]),
+                keychain: FakeKeychain(),
+                now: { clock.now }
+            ),
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            now: { clock.now },
+            pricing: { TestPricing.bundled }
+        )
+
+        for poll in 1...threshold {
+            let snapshot = await provider.refresh()
+            if poll == threshold {
+                XCTAssertEqual(snapshot.warning?.contains("penalized"), true)
+            }
+            clock.set(clock.now.addingTimeInterval(61))
+        }
+
+        let recovered = await provider.refresh() // call threshold+1: succeeds, clears the streak
+        XCTAssertNil(recovered.warning)
+        clock.set(clock.now.addingTimeInterval(61))
+
+        let afterRecovery = await provider.refresh() // call threshold+2: a fresh, single 429
+        XCTAssertEqual(afterRecovery.warning?.hasPrefix("Updates blocked by Anthropic"), true)
+        XCTAssertEqual(afterRecovery.warning?.contains("penalized"), false)
     }
 
     private func badge(_ lines: [MetricLine], _ label: String) -> String? {

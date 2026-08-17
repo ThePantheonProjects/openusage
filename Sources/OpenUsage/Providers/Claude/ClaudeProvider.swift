@@ -45,6 +45,15 @@ final class ClaudeProvider: ProviderRuntime {
     private var rateLimitedUntilBySource: [ClaudeCredentialState.Source: Date] = [:]
     private static let rateLimitCooldown: TimeInterval = 5 * 60
 
+    /// Consecutive retry-after-bearing 429s served back-to-back for a given source, with no intervening
+    /// success. Anthropic's per-login penalty can keep re-429ing the SAME login poll after poll for days
+    /// (issue behind `ClaudeUsageMapper.persistentRateLimitStreakThreshold`) — indistinguishable from an
+    /// ordinary transient rate limit by a single response, but very distinguishable across a streak. Reset
+    /// to 0 on any live success, on a 429 that carries no retry-after (a different failure shape), and
+    /// whenever this source's credential changes (`activateLiveUsageCache`) so a fresh login doesn't
+    /// inherit the prior login's penalty count.
+    private var consecutiveRateLimitedPollsBySource: [ClaudeCredentialState.Source: Int] = [:]
+
     /// Internal signal thrown by `fetchLiveUsage` when a source is rate-limited (429, or still inside a
     /// prior 429's cooldown) AND another credential source remains untried this refresh. Caught only
     /// inside `refresh()`'s candidate loop — mirrors `ClaudeAuthError.allowsAuthFallback`'s "try the next
@@ -347,7 +356,11 @@ final class ClaudeProvider: ProviderRuntime {
                 throw RateLimitedFallback()
             }
             AppLog.info(LogTag.plugin("claude"), "rate-limited (cooldown active, serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
-            return rateLimitedSnapshot(credentials: state.oauth, retryAfterSeconds: Int(until.timeIntervalSince(now()).rounded(.up)))
+            return rateLimitedSnapshot(
+                credentials: state.oauth,
+                retryAfterSeconds: Int(until.timeIntervalSince(now()).rounded(.up)),
+                consecutivePolls: consecutiveRateLimitedPollsBySource[state.source] ?? 0
+            )
         }
 
         if authStore.needsRefresh(state.oauth),
@@ -401,17 +414,29 @@ final class ClaudeProvider: ProviderRuntime {
         if response.statusCode == 429 {
             let retryAfterSeconds = ClaudeUsageMapper.parseRetryAfterSeconds(response, now: now())
             rateLimitedUntilBySource[working.source] = now().addingTimeInterval(TimeInterval(retryAfterSeconds ?? Int(Self.rateLimitCooldown)))
+            // A 429 with no retry-after is a different failure shape than the persistent-penalty case
+            // this streak is meant to catch, so it breaks the streak rather than extending it.
+            if retryAfterSeconds != nil {
+                consecutiveRateLimitedPollsBySource[working.source, default: 0] += 1
+            } else {
+                consecutiveRateLimitedPollsBySource[working.source] = 0
+            }
             if hasFallbackCandidate {
                 AppLog.info(LogTag.plugin("claude"), "rate-limited (\(working.source.label)); trying next credential source")
                 throw RateLimitedFallback()
             }
             AppLog.info(LogTag.plugin("claude"), "rate-limited (serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
-            return rateLimitedSnapshot(credentials: working.oauth, retryAfterSeconds: retryAfterSeconds)
+            return rateLimitedSnapshot(
+                credentials: working.oauth,
+                retryAfterSeconds: retryAfterSeconds,
+                consecutivePolls: consecutiveRateLimitedPollsBySource[working.source] ?? 0
+            )
         }
 
         let mapped = try ClaudeUsageMapper.mapUsageResponse(response, credentials: working.oauth, now: now())
         lastGoodUsage = mapped
         rateLimitedUntilBySource[working.source] = nil
+        consecutiveRateLimitedPollsBySource[working.source] = nil
         return mapped
     }
 
@@ -419,12 +444,16 @@ final class ClaudeProvider: ProviderRuntime {
     /// badge (no successful fetch yet this run). `lastGoodUsage` only ever holds a clean `mapUsageResponse`
     /// result (never a rate-limited snapshot), so the note is never duplicated and no stale spend tiles
     /// ride along — `probe` appends those fresh after this returns.
-    private func rateLimitedSnapshot(credentials: ClaudeOAuth, retryAfterSeconds: Int?) -> ClaudeMappedUsage {
+    private func rateLimitedSnapshot(credentials: ClaudeOAuth, retryAfterSeconds: Int?, consecutivePolls: Int) -> ClaudeMappedUsage {
         guard var mapped = lastGoodUsage else {
-            return ClaudeUsageMapper.rateLimitedUsage(credentials: credentials, retryAfterSeconds: retryAfterSeconds)
+            return ClaudeUsageMapper.rateLimitedUsage(
+                credentials: credentials,
+                retryAfterSeconds: retryAfterSeconds,
+                consecutivePolls: consecutivePolls
+            )
         }
         mapped.lines.append(ClaudeUsageMapper.rateLimitedNote(retryAfterSeconds: retryAfterSeconds))
-        mapped.warning = ClaudeUsageMapper.rateLimitedWarning(retryAfterSeconds: retryAfterSeconds)
+        mapped.warning = ClaudeUsageMapper.rateLimitedWarning(retryAfterSeconds: retryAfterSeconds, consecutivePolls: consecutivePolls)
         return mapped
     }
 
@@ -440,6 +469,7 @@ final class ClaudeProvider: ProviderRuntime {
         cachedCredentialFingerprints[state.source] = fingerprint
         lastGoodUsage = nil
         rateLimitedUntilBySource[state.source] = nil
+        consecutiveRateLimitedPollsBySource[state.source] = nil
     }
 
     private static func credentialFingerprint(_ credentials: ClaudeOAuth) -> Data {
