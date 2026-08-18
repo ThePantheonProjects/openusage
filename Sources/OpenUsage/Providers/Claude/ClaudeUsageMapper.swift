@@ -38,7 +38,7 @@ enum ClaudeUsageMapper {
 
     /// Snapshot shown when the usage endpoint rate-limits us and there is no last-good usage to fall back
     /// on (e.g. the first fetch after launch): a status badge plus the staleness note, no live bars.
-    static func rateLimitedUsage(credentials: ClaudeOAuth, retryAfterSeconds: Int?) -> ClaudeMappedUsage {
+    static func rateLimitedUsage(credentials: ClaudeOAuth, retryAfterSeconds: Int?, consecutivePolls: Int = 0) -> ClaudeMappedUsage {
         let retryText = retryAfterSeconds.map(formatRateLimitMinutes)
         let waitText = retryText.map { "Rate limited, retry in ~\($0)" } ?? "Rate limited, try again later"
         return ClaudeMappedUsage(
@@ -47,7 +47,7 @@ enum ClaudeUsageMapper {
                 .badge(label: "Status", text: waitText, colorHex: "#F59E0B"),
                 rateLimitedNote(retryAfterSeconds: retryAfterSeconds)
             ],
-            warning: rateLimitedWarning(retryAfterSeconds: retryAfterSeconds)
+            warning: rateLimitedWarning(retryAfterSeconds: retryAfterSeconds, consecutivePolls: consecutivePolls)
         )
     }
 
@@ -55,7 +55,17 @@ enum ClaudeUsageMapper {
     /// lines above only render when their metrics are enabled in the layout, so without this the default
     /// dashboard showed bare "No data" rows with no hint of why. Also warns the
     /// user off manual refreshes, which extend Anthropic's rate limiting.
-    static func rateLimitedWarning(retryAfterSeconds: Int?) -> String {
+    /// Consecutive retry-after-bearing 429 polls (same credential source, no intervening success or
+    /// shape change) at or beyond which the warning stops saying "be patient" and names the actual fix.
+    /// Anthropic penalizes a specific LOGIN, not the account — a card stuck on a penalized login can sit
+    /// dark for days while a second, dedicated login on the same account reads clean the whole time. See
+    /// `ClaudeProvider.consecutiveRateLimitedPollsBySource`.
+    static let persistentRateLimitStreakThreshold = 6
+
+    static func rateLimitedWarning(retryAfterSeconds: Int?, consecutivePolls: Int = 0) -> String {
+        guard consecutivePolls < persistentRateLimitStreakThreshold else {
+            return "This login is rate-limit-penalized by Anthropic — other logins on this account read fine. Add a dedicated reader login for this card."
+        }
         let base = "Updates blocked by Anthropic. Be patient — manual refreshes will make it worse."
         guard let retryText = retryAfterSeconds.map(formatRateLimitMinutes) else { return base }
         return "\(base) Retrying in ~\(retryText)."
